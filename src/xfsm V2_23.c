@@ -487,181 +487,129 @@ static JsVar *getTransitionActionsRaw(JsVar *transitionObj) {
   return acts; // locked
 }
 
-/* Execute an array of actions against (ctx,event).
- * Call sites (kept compatible):
- *   run_actions_raw(service, &ctx, exitActs,  event, fromName, toName);
- *   run_actions_raw(service, &ctx, transActs, event, fromName, toName);
- *   run_actions_raw(service, &ctx, entryActs, event, fromName, toName);
- *
- * Supports:
- *   - function(ctx,evt)
- *   - { exec:function(ctx,evt) }
- *   - "name"                -> lookup in actions map(s)
- *   - { type:"name" }       -> lookup in actions map(s)
- *   - xstate.assign family  -> apply_assignment(...) (updates *pCtx)
+/**
+ * run_actions_raw (V2)
+ * Execute actions with (context,event).
+ * - assign actions mutate *pCtx immediately so subsequent actions see updates.
+ * - function items are called directly.
+ * - string items are resolved via options.actions maps.
+ * - object-form actions with 'assignment' or type=='xstate.assign' are treated as assign.
  */
-void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
-                            JsVar *eventObj, const char *fromName,
-                            const char *toName) {
-  (void)fromName;
-  (void)toName; // currently unused (kept for signature compatibility)
-  if (!actionsArr || !jsvIsArray(actionsArr))
-    return;
+void run_actions_raw(JsVar *svc, JsVar **pCtx /*in/out*/, JsVar *actions /*array or 0*/, JsVar *eventObj /*object or 0*/, const char *fromStr, const char *toStr) {
+  if (!actions || !jsvIsArray(actions)) return;
 
-  /* --- Resolve actions map (preferred -> fallbacks) ---
-   * 1) service._options.actions
-   * 2) service._machine._options.actions
-   * 3) service._machine.config.options.actions
-   * 4) service._machine.config.actions
-   */
+  /* Resolve options.actions maps: service -> machine.options -> machine.config.options/actions */
+  JsVar *machine = jsvObjectGetChild(svc, K_MACHINE, 0);
   JsVar *actsMap = 0;
-  {
-    JsVar *opts = jsvObjectGetChild(service, "_options", 0);
-    if (opts) {
-      actsMap = jsvObjectGetChild(opts, "actions", 0);
-      jsvUnLock(opts);
-    }
-    if (!actsMap) {
-      JsVar *mach = jsvObjectGetChild(service, "_machine", 0);
-      if (mach) {
-        JsVar *mopts = jsvObjectGetChild(mach, "_options", 0);
-        if (mopts) {
-          actsMap = jsvObjectGetChild(mopts, "actions", 0);
-          jsvUnLock(mopts);
-        }
-        if (!actsMap) {
-          JsVar *cfg = jsvObjectGetChild(mach, "config", 0);
-          if (cfg) {
-            JsVar *copt = jsvObjectGetChild(cfg, "options", 0);
-            if (copt) {
-              actsMap = jsvObjectGetChild(copt, "actions", 0);
-              jsvUnLock(copt);
-            }
-            if (!actsMap)
-              actsMap = jsvObjectGetChild(cfg, "actions", 0);
-            jsvUnLock(cfg);
-          }
-        }
-        jsvUnLock(mach);
+
+  /* service._options.actions */
+  JsVar *opt = jsvObjectGetChild(svc, "_options", 0);
+  if (opt && jsvIsObject(opt)) actsMap = jsvObjectGetChild(opt, "actions", 0);
+  if (!(actsMap && jsvIsObject(actsMap))) { if (actsMap) jsvUnLock(actsMap); actsMap = 0; }
+  if (opt) jsvUnLock(opt);
+
+  /* machine.options.actions */
+  if (!actsMap && machine) {
+    opt = jsvObjectGetChild(machine, "options", 0);
+    if (opt && jsvIsObject(opt)) actsMap = jsvObjectGetChild(opt, "actions", 0);
+    if (!(actsMap && jsvIsObject(actsMap))) { if (actsMap) jsvUnLock(actsMap); actsMap = 0; }
+    if (opt) jsvUnLock(opt);
+  }
+
+  /* machine.config.options.actions or machine.config.actions */
+  if (!actsMap && machine) {
+    JsVar *cfg = jsvObjectGetChild(machine, K_CFG, 0);
+    if (cfg) {
+      JsVar *opt2 = jsvObjectGetChild(cfg, "options", 0);
+      if (opt2 && jsvIsObject(opt2)) actsMap = jsvObjectGetChild(opt2, "actions", 0);
+      if (!(actsMap && jsvIsObject(actsMap))) {
+        if (actsMap) { jsvUnLock(actsMap); actsMap = 0; }
+        actsMap = jsvObjectGetChild(cfg, "actions", 0);
       }
+      if (opt2) jsvUnLock(opt2);
+      jsvUnLock(cfg);
     }
   }
 
-  unsigned int len = (unsigned int)jsvGetArrayLength(actionsArr);
-  for (unsigned int i = 0; i < len; i++) {
-    JsVar *item = jsvGetArrayItem(actionsArr, i); // LOCKED (or 0)
-    if (!item)
-      continue;
+  /* iterate and execute */
+  JsVarInt len = jsvGetArrayLength(actions);
+  for (JsVarInt i=0; i<len; i++) {
+    JsVar *item = jsvGetArrayItem(actions, i);
+    if (!item) continue;
 
     bool handled = false;
 
-    /* A) direct function */
+    /* 1) object-form assign */
+    if (jsvIsObject(item)) {
+      /* detect { type:"xstate.assign", ... } OR { assignment: ... } */
+      bool isAssign = false;
+      JsVar *t = jsvObjectGetChild(item, "type", 0);
+      if (t && jsvIsString(t)) {
+        char tb[32]=""; str_from_jsv(t, tb, sizeof(tb));
+        if (0==strcmp(tb, "xstate.assign") || 0==strcmp(tb, "assign")) isAssign = true;
+      }
+      if (t) jsvUnLock(t);
+      if (!isAssign) {
+        /* some builds store assign in 'assignment' field without type */
+        JsVar *ass = jsvObjectGetChild(item, "assignment", 0);
+        if (ass) { isAssign = true; jsvUnLock(ass); }
+      }
+
+      if (isAssign) {
+        /* apply assignment immediately; updates *pCtx in place */
+        apply_assignment(svc, pCtx, item, eventObj);
+        handled = true;
+      } else {
+        /* object-form custom action: if 'exec' is function, call it like a function */
+        JsVar *exec = jsvObjectGetChild(item, "exec", 0);
+        if (exec && jsvIsFunction(exec)) {
+          JsVar *args[2] = { *pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
+                             eventObj ? jsvLockAgain(eventObj) : jsvNewObject() };
+          JsVar *res = xfsm_callJsFunction(exec, 0, args, 2);
+          if (args[0]) jsvUnLock(args[0]);
+          if (args[1]) jsvUnLock(args[1]);
+          if (res) jsvUnLock(res);
+          handled = true;
+        }
+        if (exec) jsvUnLock(exec);
+      }
+    }
+
+    /* 2) direct function */
     if (!handled && jsvIsFunction(item)) {
-      JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
-                        eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-      JsVar *res = jspExecuteFunction(item, service, 2, argv);
-      if (res)
-        jsvUnLock(res);
-      if (argv[0])
-        jsvUnLock(argv[0]);
-      if (argv[1])
-        jsvUnLock(argv[1]);
+      JsVar *args[2] = { *pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
+                         eventObj ? jsvLockAgain(eventObj) : jsvNewObject() };
+      JsVar *res = xfsm_callJsFunction(item, 0, args, 2);
+      if (args[0]) jsvUnLock(args[0]);
+      if (args[1]) jsvUnLock(args[1]);
+      if (res) jsvUnLock(res);
       handled = true;
     }
 
-    /* B) object action */
-    if (!handled && jsvIsObject(item)) {
-      /* B1) { exec:function } */
-      JsVar *exec = jsvObjectGetChild(item, "exec", 0);
-      if (exec && jsvIsFunction(exec)) {
-        JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
-                          eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-        JsVar *res = jspExecuteFunction(exec, service, 2, argv);
-        if (res)
-          jsvUnLock(res);
-        if (argv[0])
-          jsvUnLock(argv[0]);
-        if (argv[1])
-          jsvUnLock(argv[1]);
-        handled = true;
-      }
-      if (exec)
-        jsvUnLock(exec);
-
-      /* B2) { type:"..." } */
-      if (!handled) {
-        JsVar *typ = jsvObjectGetChild(item, "type", 0);
-        if (typ && jsvIsString(typ)) {
-          char tbuf[32];
-          int tlen = jsvGetString(typ, tbuf, sizeof(tbuf) - 1);
-          if (tlen < 0)
-            tlen = 0;
-          tbuf[tlen] = 0;
-
-          if (!strcmp(tbuf, "xstate.assign") || !strcmp(tbuf, "assign")) {
-            /* assign family -> updates *pCtx */
-            apply_assignment(service, pCtx, item, eventObj);
-            handled = true;
-          } else if (actsMap && jsvIsObject(actsMap)) {
-            /* NEW: object-form named action via actions map(s) */
-            JsVar *fn = jsvObjectGetChild(actsMap, tbuf, 0);
-            if (fn && jsvIsFunction(fn)) {
-              JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
-                                eventObj ? jsvLockAgain(eventObj)
-                                         : jsvNewObject()};
-              JsVar *res = jspExecuteFunction(fn, service, 2, argv);
-              if (res)
-                jsvUnLock(res);
-              if (argv[0])
-                jsvUnLock(argv[0]);
-              if (argv[1])
-                jsvUnLock(argv[1]);
-              handled = true;
-            }
-            if (fn)
-              jsvUnLock(fn);
-          }
-        }
-        if (typ)
-          jsvUnLock(typ);
-      }
-
-      /* B3) shorthand assign object (no type/exec) */
-      if (!handled) {
-        apply_assignment(service, pCtx, item, eventObj);
-        handled = true;
-      }
-    }
-
-    /* C) "name" -> resolve via actions map(s) */
+    /* 3) named action (string) */
     if (!handled && jsvIsString(item) && actsMap && jsvIsObject(actsMap)) {
-      char nbuf[32];
-      int nlen = jsvGetString(item, nbuf, sizeof(nbuf) - 1);
-      if (nlen < 0)
-        nlen = 0;
-      nbuf[nlen] = 0;
-      JsVar *fn = jsvObjectGetChild(actsMap, nbuf, 0);
+    
+      JsVar *str = jsvAsString(item);   // convert item to string key
+      JsVar *fn  = jsvObjectGetChild(actsMap, str, 0);
+      jsvUnLock(str);
+
       if (fn && jsvIsFunction(fn)) {
-        JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
-                          eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-        JsVar *res = jspExecuteFunction(fn, service, 2, argv);
-        if (res)
-          jsvUnLock(res);
-        if (argv[0])
-          jsvUnLock(argv[0]);
-        if (argv[1])
-          jsvUnLock(argv[1]);
-        handled = true;
+        JsVar *args[2] = { *pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
+                           eventObj ? jsvLockAgain(eventObj) : jsvNewObject() };
+        JsVar *res = xfsm_callJsFunction(fn, 0, args, 2);
+        if (args[0]) jsvUnLock(args[0]);
+        if (args[1]) jsvUnLock(args[1]);
+        if (res) jsvUnLock(res);
       }
-      if (fn)
-        jsvUnLock(fn);
+      if (fn) jsvUnLock(fn);
+      handled = true;
     }
 
     jsvUnLock(item);
   }
 
-  if (actsMap)
-    jsvUnLock(actsMap);
+  if (actsMap) jsvUnLock(actsMap);
+  if (machine) jsvUnLock(machine);
 }
 
 /* ========================================================================== */

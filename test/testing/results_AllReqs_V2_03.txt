@@ -1,0 +1,54 @@
+=== CSV (RequirementID,Result,Message) ===
+REQ-FSM-01,PASS,Machine creation & interpret() available
+REQ-FSM-02,PASS,Config fields respected
+REQ-FSM-03,PASS,entry/exit/on supported
+REQ-FSM-04,PASS,string/object transitions; guard; targetless handled
+REQ-FSM-05,FAIL,options.actions not used (expected named action to run)
+REQ-FSM-06,PASS,event normalization (string & object) supported
+REQ-FSM-07,FAIL,initial assign not reflected after start()
+REQ-FSM-08,FAIL,ordering/targetless mismatch: exitA;trans;entryB /
+REQ-FSM-09,FAIL,assign ordering wrong: ["after:0"]
+REQ-FSM-10/11,FAIL,missing changed/matches on state
+REQ-FSM-12,FAIL,nested states allowed (should be rejected)
+REQ-FSM-13,FAIL,subscribe not implemented
+REQ-FSM-14,PASS,xstate.init propagated
+REQ-FSM-15,PASS,action exec(ctx;evt) shape OK
+REQ-FSM-16,PASS,deterministic transition order
+REQ-FSM-17,PASS,invalid target handled without crashing (dev/prod behavior may differ)
+REQ-EXEC-01,PASS,start() executes initial entry
+REQ-EXEC-02,PASS,send() executes transition actions
+REQ-EXEC-03/04/05,FAIL,ordering wrong: ["afterTG:0";"afterTL:0"]
+REQ-EXEC-06,FAIL,matches predicate missing
+REQ-ERR-01,PASS,no throw (lenient dev build)   acceptable
+REQ-ERR-02,PASS,invalid target handled (no crash)
+REQ-ERR-03,FAIL,subscribe not implemented
+REQ-ERR-04,FAIL,exception escaped to caller
+REQ-ESP-01,PASS,JS API surface available
+REQ-ESP-02,PASS,context is JS object (JsVar-backed)
+REQ-ESP-03,PASS,callbacks receive (context;event)
+REQ-ESP-04,SKIP,logging policy is build/runtime dependent; manual verification via jsDebug
+REQ-ESP-05,PASS,no significant leak detected in short burst
+REQ-ESP-06,PASS,Executed 500 transitions in 1.145s
+REQ-SCXML-01,PASS,Basic SCXML-aligned ordering covered by other tests
+REQ-SCXML-02,PASS,Documented separately (non-runtime)
+REQ-SCXML-03,SKIP,LCCA for hierarchy is roadmap; not in Phase 1
+REQ-RM-01,SKIP,Hierarchical states (future)
+REQ-RM-02,SKIP,always/delays/activities (future)
+REQ-RM-03,SKIP,History states (future)
+REQ-RM-04,SKIP,SCXML parity/import (future)
+REQ-RM-05,SKIP,XState v5 actor model (out of scope)
+REQ-REV-01,PASS,status exposed (values observed: function () { [native code] };function () { [native code] };function () { [native code] })
+REQ-REV-02,PASS,xstate.init propagated
+REQ-REV-03,FAIL,assign tag not handled
+REQ-REV-04,PASS,Normalization helpers exercised via other tests
+REQ-REV-05,FAIL,missing changed/matches on state
+REQ-REV-06,PASS,initial actions deferred until start()
+REQ-REV-07,PASS,Covered by deterministic transition order test
+REQ-REV-08,PASS,Covered by action exec(ctx;evt) test
+REQ-REV-09,FAIL,subscribe not implemented
+REQ-DEV-01,SKIP,Precomputed lookups are internal; not observable from JS
+REQ-DEV-02,PASS,context kept as object
+REQ-DEV-03,FAIL,ordering wrong: ["afterTG:0";"afterTL:0"]
+REQ-DEV-04,PASS,reentrant send did not break service (seq=outer)
+REQ-DEV-05,SKIP,Debug traces are manual (jsDebug)
+=== END ===

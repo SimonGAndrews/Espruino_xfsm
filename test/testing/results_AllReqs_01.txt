@@ -1,0 +1,37 @@
+=== CSV (RequirementID,Result,Message) === 
+,PASS,Machine creation & interpret() available 
+,PASS,Config fields respected ,PASS,entry/exit/on supported 
+,FAIL,Exception: Service.send: event must be a string 
+,FAIL,options.actions not used (expected named action to run) 
+REQ-FSM-06,FAIL,object-form event not supported (count=1; caught=true) 
+,PASS,initial prep/assign OK; exec on start() 
+,FAIL,Exception: Got '=' expected EOF 
+,PASS,assign before non-assign 
+,FAIL,missing changed/matches on state 
+,FAIL,nested states allowed (should be rejected) 
+,FAIL,subscribe not implemented 
+REQ-FSM-14,FAIL,init event not xstate.init (saw ["NONE"]) 
+REQ-FSM-15,FAIL,action received unexpected parameters 
+,FAIL,order wrong or result not B: -> A 
+,PASS,invalid target handled without crashing (dev/prod behavior may differ) 
+,PASS,start() executes initial entry 
+,PASS,send() executes transition actions 
+REQ-EXEC-03/04/05,FAIL,ordering wrong: ["afterTG:1"] 
+,FAIL,matches predicate missing 
+,PASS,no throw (lenient dev build)   acceptable 
+,PASS,invalid target handled (no crash) 
+,FAIL,subscribe not implemented 
+,FAIL,exception escaped to caller 
+,PASS,JS API surface available 
+,PASS,context is JS object (JsVar-backed) 
+REQ-ESP-03,FAIL,callback did not receive expected event 
+,SKIP,logging policy is build/runtime dependent; manual verification via jsDebug 
+,PASS,no significant leak detected in short burst ,PASS,Executed 500 transitions in 1.022s 
+,PASS,Basic SCXML-aligned ordering covered by other tests 
+,PASS,Documented separately (non-runtime) 
+,SKIP,LCCA for hierarchy is roadmap; not in Phase 1 
+,SKIP,Hierarchical states (future) 
+,SKIP,always/delays/activities (future) 
+,SKIP,History states (future) 
+,SKIP,SCXML parity/import (future) 
+,SKIP,XSt
