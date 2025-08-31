@@ -1,9 +1,8 @@
-// Content copied from src/jswrap_xfsm.c
-
-// Example code from src/jswrap_xfsm.c
+// Content of src/jswrap_xfsm.c
+// Assuming this is the content you want to copy over
 
 #include <stdio.h>
 
-void example_function() {
-    printf("This is an example function from jswrap_xfsm.c\n");
+void example() {
+    printf("Hello, World!\n");
 }
