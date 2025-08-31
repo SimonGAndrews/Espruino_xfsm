@@ -1,5 +1,10 @@
-// Content of src/xfsm.c from blob SHA fb4e3deb52f0caa799c5fcd2184573bfb6c93cea
-
 #include <stdio.h>
+#include <stdlib.h>
 
-// Add the actual content here
+// Content from src/xfsm.c
+// (Assuming the content is available for replication)
+
+int main() {
+    // Your code here
+    return 0;
+}
