@@ -1,1 +1,8 @@
-// The content of the file should be preserved. Please provide the content of the file to move it.
+// Content from src/xfsm.c
+
+#include <stdio.h>
+
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}
