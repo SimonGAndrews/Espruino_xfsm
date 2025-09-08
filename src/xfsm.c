@@ -248,10 +248,6 @@ static void set_status(JsVar *obj, const char *txt) {
   JsVar *v = jsvNewFromString(txt);
   jsvObjectSetChildAndUnLock(obj, K_STATUS, v);
 }
-static void set_str_prop(JsVar *obj, const char *k, const char *txt) {
-  JsVar *v = jsvNewFromString(txt);
-  jsvObjectSetChildAndUnLock(obj, k, v);
-}
 static int str_from_jsv(JsVar *s, char *buf, size_t bufSize) {
   if (!s || !jsvIsString(s) || bufSize == 0) return 0;
   size_t n = jsvGetString(s, buf, bufSize-1);
