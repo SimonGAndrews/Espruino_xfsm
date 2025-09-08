@@ -342,26 +342,6 @@ static bool is_string_eq(JsVar *v, const char *s) {
   return 0 == strcmp(buf, s);
 }
 
-/* Recognise assign action:
-   - { type:"xstate.assign", assignment: ... }
-   - { type:"assign", assignment: ... }
-   - OR plain object (no 'type'): treat as shorthand assignment spec {k:fn|val,...}
-*/
-static bool is_assign_action(JsVar *item) {
-  if (!item || !jsvIsObject(item)) return false;
-  JsVar *type = jsvObjectGetChild(item, "type", 0); // locked or 0
-  if (type) {
-    bool ok = is_string_eq(type, "xstate.assign") || is_string_eq(type, "assign");
-    jsvUnLock(type);
-    if (!ok) return false;
-    JsVar *ass = jsvObjectGetChild(item, "assignment", 0);
-    if (ass) { jsvUnLock(ass); return true; }
-    return false;
-  }
-  /* plain object -> shorthand assignment spec */
-  return true;
-}
-
 /* Shallow-merge 'patch' object into *pCtx (no jsvGetKeys; use iterator) */
 static void merge_patch_into_ctx(JsVar **pCtx, JsVar *patch) {
   if (!*pCtx || !jsvIsObject(*pCtx)) { if (*pCtx) jsvUnLock(*pCtx); *pCtx = jsvNewObject(); }
