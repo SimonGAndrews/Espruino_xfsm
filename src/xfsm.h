@@ -14,6 +14,9 @@ typedef enum {
   XFSM_STATUS_STOPPED    = 2
 } XfsmStatus;
 
+/* Map status enum to stable text (static const strings) */
+const char *xfsm_status_to_text(XfsmStatus st);
+
 /* ------------------------------------------------------------------------- */
 /*  V1 single-object FSM (kept for compatibility)                            */
 /*  Prefer Service/Machine API (V2+) for new development.                    */

@@ -142,20 +142,40 @@ static const char * const K_SCTX    = "_context";
 static const char * const K_SSTATUS = "_status";
 
 /* ---------------- Function invocation helper ---------------- */
+/* Safe call wrapper to prevent action exceptions from escaping to caller */
+static JsVar *xfsm_safe_call = 0; // (fn, thisArg, a0, a1) => try { fn.call(thisArg, a0, a1) } catch(e) { undefined }
+static void xfsm_ensure_safe_call(void) {
+  if (xfsm_safe_call && jsvIsFunction(xfsm_safe_call)) return;
+  JsVar *src = jsvNewFromString(
+    "(function(fn,th,a0,a1){try{return fn.call(th,a0,a1);}catch(e){return void 0;}})"
+  );
+  if (!src) return;
+  JsVar *fn = jspEvaluateVar(src, 0 /*global*/, "xfsm.safeCall");
+  jsvUnLock(src);
+  if (fn && jsvIsFunction(fn)) xfsm_safe_call = fn; else { if (fn) jsvUnLock(fn); xfsm_safe_call = 0; }
+}
+
 static JsVar *xfsm_callJsFunction(JsVar *fn, JsVar *thisArg, JsVar **argv, int argc) {
   if (!fn || !jsvIsFunction(fn)) return 0;
+  xfsm_ensure_safe_call();
   JsVar *thisObj = thisArg ? jsvLockAgain(thisArg) : jsvNewNull();
-  JsVar *res = jspExecuteFunction(fn, thisObj, argc, argv); // locked or 0
+  JsVar *res = 0;
+  if (xfsm_safe_call && jsvIsFunction(xfsm_safe_call)) {
+    JsVar *safe = jsvLockAgain(xfsm_safe_call);
+    JsVar *args4[4] = { jsvLockAgain(fn), jsvLockAgain(thisObj), (argc>0 && argv && argv[0]) ? jsvLockAgain(argv[0]) : jsvNewNull(), (argc>1 && argv && argv[1]) ? jsvLockAgain(argv[1]) : jsvNewNull() };
+    res = jspExecuteFunction(safe, 0 /*this*/, 4, args4);
+    if (args4[0]) jsvUnLock(args4[0]);
+    if (args4[1]) jsvUnLock(args4[1]);
+    if (args4[2]) jsvUnLock(args4[2]);
+    if (args4[3]) jsvUnLock(args4[3]);
+    jsvUnLock(safe);
+  } else {
+    /* Fallback: direct call (may propagate exceptions on old builds) */
+    res = jspExecuteFunction(fn, thisObj, argc, argv);
+  }
   jsvUnLock(thisObj);
   return res;
 }
-
-/** Notify all registered listeners with the current state (argument 0). */
-#include "jsutils.h"
-#include "jsinteractive.h"
-#include "jsparse.h"
-#include "jsvar.h"
-#include "xfsm.h"
 
 /** Notify all registered listeners with the current state (argument 0). */
 void xfsm_notify_listeners(JsVar *service) {
@@ -336,12 +356,6 @@ static JsVar *resolveFunc(JsVar *owner, JsVar *item /*locked*/) {
 }
 
 /* ---------------- Built-in 'assign' support ---------------- */
-static bool is_string_eq(JsVar *v, const char *s) {
-  if (!v || !jsvIsString(v)) return false;
-  char buf[32]; size_t n = jsvGetString(v, buf, sizeof(buf)-1); buf[n] = 0;
-  return 0 == strcmp(buf, s);
-}
-
 /* Apply an 'assignment' spec (function or object) to produce a patch and merge */
 static void apply_assignment(JsVar *svc, JsVar **pCtx, JsVar *assignAction, JsVar *eventObj) {
   if (!pCtx) return;
@@ -567,7 +581,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
     if (!handled && jsvIsFunction(item)) {
       JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
                         eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-      JsVar *res = jspExecuteFunction(item, service, 2, argv);
+      JsVar *res = xfsm_callJsFunction(item, service, argv, 2);
       if (res)
         jsvUnLock(res);
       if (argv[0])
@@ -584,7 +598,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
       if (exec && jsvIsFunction(exec)) {
         JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
                           eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-        JsVar *res = jspExecuteFunction(exec, service, 2, argv);
+        JsVar *res = xfsm_callJsFunction(exec, service, argv, 2);
         if (res)
           jsvUnLock(res);
         if (argv[0])
@@ -613,7 +627,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
               JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
                                 eventObj ? jsvLockAgain(eventObj)
                                          : jsvNewObject()};
-              JsVar *res = jspExecuteFunction(fn, service, 2, argv);
+              JsVar *res = xfsm_callJsFunction(fn, service, argv, 2);
               if (res)
                 jsvUnLock(res);
               if (argv[0])
@@ -644,7 +658,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
       if (fn && jsvIsFunction(fn)) {
         JsVar *argv[2] = {*pCtx ? jsvLockAgain(*pCtx) : jsvNewObject(),
                           eventObj ? jsvLockAgain(eventObj) : jsvNewObject()};
-        JsVar *res = jspExecuteFunction(fn, service, 2, argv);
+        JsVar *res = xfsm_callJsFunction(fn, service, argv, 2);
         if (res)
           jsvUnLock(res);
         if (argv[0])
@@ -670,7 +684,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
 void xfsm_init_object(JsVar *fsmObject) {
   if (!fsmObject) return;
   JsVar *v = jsvObjectGetChild(fsmObject, K_STATUS, 0);
-  if (!v) set_status(fsmObject, "NotStarted"); else jsvUnLock(v);
+  if (!v) set_status(fsmObject, xfsm_status_to_text(XFSM_STATUS_NOTSTARTED)); else jsvUnLock(v);
 }
 
 XfsmStatus xfsm_start_object(JsVar *fsmObject, JsVar *initialState /*locked or 0*/) {
@@ -690,7 +704,7 @@ XfsmStatus xfsm_start_object(JsVar *fsmObject, JsVar *initialState /*locked or 0
   }
 
   jsvObjectSetChildAndUnLock(fsmObject, K_STATE, chosen);
-  set_status(fsmObject, "Running");
+  set_status(fsmObject, xfsm_status_to_text(XFSM_STATUS_RUNNING));
 
   /* entry actions */
   JsVar *cfg   = getChildObj(fsmObject, K_CFG);
@@ -718,7 +732,7 @@ XfsmStatus xfsm_start_object(JsVar *fsmObject, JsVar *initialState /*locked or 0
   return XFSM_STATUS_RUNNING;
 }
 
-void xfsm_stop_object(JsVar *fsmObject) { if (!fsmObject) return; set_status(fsmObject,"Stopped"); }
+void xfsm_stop_object(JsVar *fsmObject) { if (!fsmObject) return; set_status(fsmObject, xfsm_status_to_text(XFSM_STATUS_STOPPED)); }
 
 XfsmStatus xfsm_status_object(JsVar *fsmObject) {
   if (!fsmObject) return XFSM_STATUS_NOTSTARTED;
@@ -727,8 +741,10 @@ XfsmStatus xfsm_status_object(JsVar *fsmObject) {
   XfsmStatus st = XFSM_STATUS_NOTSTARTED;
   if (jsvIsString(v)) {
     char sbuf[16]; str_from_jsv(v,sbuf,sizeof(sbuf));
-    if (!strcmp(sbuf,"Running")) st=XFSM_STATUS_RUNNING;
-    else if (!strcmp(sbuf,"Stopped")) st=XFSM_STATUS_STOPPED;
+    const char *runTxt = xfsm_status_to_text(XFSM_STATUS_RUNNING);
+    const char *stpTxt = xfsm_status_to_text(XFSM_STATUS_STOPPED);
+    if (!strcmp(sbuf, runTxt)) st = XFSM_STATUS_RUNNING;
+    else if (!strcmp(sbuf, stpTxt)) st = XFSM_STATUS_STOPPED;
   }
   jsvUnLock(v);
   return st;
@@ -1196,7 +1212,7 @@ void xfsm_service_init(JsVar *serviceObj, JsVar *machineObj) {
   xfsm_ensure_unsub_factory();
 
   /* Set status to NotStarted */
-  jsvObjectSetChildAndUnLock(serviceObj, K_SSTATUS, jsvNewFromString("NotStarted"));
+  jsvObjectSetChildAndUnLock(serviceObj, K_SSTATUS, jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_NOTSTARTED)));
 
 }
 
@@ -1209,41 +1225,91 @@ JsVar *xfsm_service_start(JsVar *svc) {
   if (status && jsvIsString(status)) {
     char s[16]; str_from_jsv(status, s, sizeof(s));
     jsvUnLock(status);
-    if (!strcmp(s, "Running")) return jsvLockAgain(svc);
+    const char *runTxt = xfsm_status_to_text(XFSM_STATUS_RUNNING);
+    if (!strcmp(s, runTxt)) return jsvLockAgain(svc);
+    /* If we were previously Stopped, we should reinitialize to machine.initial */
+    const char *stpTxt = xfsm_status_to_text(XFSM_STATUS_STOPPED);
+    bool wasStopped = (0 == strcmp(s, stpTxt));
+    (void)wasStopped; /* used below */
+    
+    JsVar *m = jsvObjectGetChild(svc, K_MACHINE, 0);
+    if (!m) return 0;
+
+    /* Choose initial state object for this (re)start */
+    JsVar *st = 0;
+    if (wasStopped) {
+      /* Fresh start after stop: recompute initial state */
+      st = xfsm_machine_initial_state(m);
+      if (!st) { jsvUnLock(m); return 0; }
+    } else {
+      /* NotStarted (or unknown): prefer pre-seeded initial state from init() */
+      st = jsvObjectGetChild(svc, K_SSTATE, 0);
+      if (!st) {
+        st = xfsm_machine_initial_state(m);
+        if (!st) { jsvUnLock(m); return 0; }
+      }
+    }
+
+    /* run entry actions with xstate.init */
+    /* Prefer precomputed context from initial state (includes entry assigns),
+       falling back to service context if absent */
+    JsVar *ctx = jsvObjectGetChild(st, S_CTX, 0);
+    if (!ctx) ctx = jsvObjectGetChild(svc, K_SCTX, 0);
+    JsVar *acts = jsvObjectGetChild(st, S_ACTS, 0);
+    JsVar *val  = jsvObjectGetChild(st, S_VALUE, 0);
+    char toBuf[64] = "";
+    if (val && jsvIsString(val)) str_from_jsv(val, toBuf, sizeof(toBuf));
+
+    JsVar *evtInit = jsvNewObject();
+    if (evtInit) jsvObjectSetChildAndUnLock(evtInit, "type", jsvNewFromString("xstate.init"));
+    run_actions_raw(svc, &ctx, acts, evtInit, 0, toBuf);
+    if (evtInit) jsvUnLock(evtInit);
+
+    /* persist updated context back to service */
+    if (ctx) {
+      jsvObjectSetChildAndUnLock(svc, K_SCTX, jsvLockAgain(ctx));
+      /* IMPORTANT: also reflect into stored state object */
+      jsvObjectSetChildAndUnLock(st, S_CTX, jsvLockAgain(ctx));
+      jsvUnLock(ctx);
+    }
+
+    /* commit state + status */
+    jsvObjectSetChildAndUnLock(svc, K_SSTATE, jsvLockAgain(st));
+    jsvObjectSetChildAndUnLock(svc, K_SSTATUS, jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_RUNNING)));
+
+    xfsm_notify_listeners(svc);
+
+    if (val) jsvUnLock(val);
+    if (acts) jsvUnLock(acts);
+    jsvUnLock(st);
+    jsvUnLock(m);
+    return jsvLockAgain(svc);
   } else if (status) jsvUnLock(status);
 
+  /* NotStarted and no status string: fall back to original path */
   JsVar *m = jsvObjectGetChild(svc, K_MACHINE, 0);
   if (!m) return 0;
-
   JsVar *st = xfsm_machine_initial_state(m);
   if (!st) { jsvUnLock(m); return 0; }
-
-  /* run entry actions with xstate.init */
-  JsVar *ctx = jsvObjectGetChild(svc, K_SCTX, 0);
+  
+  JsVar *ctx = jsvObjectGetChild(st, S_CTX, 0);
+  if (!ctx) ctx = jsvObjectGetChild(svc, K_SCTX, 0);
   JsVar *acts = jsvObjectGetChild(st, S_ACTS, 0);
   JsVar *val  = jsvObjectGetChild(st, S_VALUE, 0);
   char toBuf[64] = "";
   if (val && jsvIsString(val)) str_from_jsv(val, toBuf, sizeof(toBuf));
-
   JsVar *evtInit = jsvNewObject();
   if (evtInit) jsvObjectSetChildAndUnLock(evtInit, "type", jsvNewFromString("xstate.init"));
   run_actions_raw(svc, &ctx, acts, evtInit, 0, toBuf);
   if (evtInit) jsvUnLock(evtInit);
-
-  /* persist updated context back to service */
   if (ctx) {
     jsvObjectSetChildAndUnLock(svc, K_SCTX, jsvLockAgain(ctx));
-    /* IMPORTANT: also reflect into stored state object */
     jsvObjectSetChildAndUnLock(st, S_CTX, jsvLockAgain(ctx));
     jsvUnLock(ctx);
   }
-
-  /* commit state + status */
   jsvObjectSetChildAndUnLock(svc, K_SSTATE, jsvLockAgain(st));
-  jsvObjectSetChildAndUnLock(svc, K_SSTATUS, jsvNewFromString("Running"));
-
+  jsvObjectSetChildAndUnLock(svc, K_SSTATUS, jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_RUNNING)));
   xfsm_notify_listeners(svc);
-
   if (val) jsvUnLock(val);
   if (acts) jsvUnLock(acts);
   jsvUnLock(st);
@@ -1255,7 +1321,7 @@ JsVar *xfsm_service_stop(JsVar *svc) {
   if (!svc) return 0;
 
   // Status -> "Stopped"
-  jsvObjectSetChildAndUnLock(svc, K_SSTATUS, jsvNewFromString("Stopped"));
+  jsvObjectSetChildAndUnLock(svc, K_SSTATUS, jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_STOPPED)));
 
   // Clear all listeners
   JsVar *empty = jsvNewObject();
@@ -1279,7 +1345,11 @@ JsVar *xfsm_service_send(JsVar *svc, JsVar *event /*string or object*/) {
   /* must be running */
   JsVar *st = jsvObjectGetChild(svc, K_SSTATUS, 0);
   bool running = false;
-  if (st && jsvIsString(st)) { char s[16]; str_from_jsv(st, s, sizeof(s)); running = (0==strcmp(s,"Running")); }
+  if (st && jsvIsString(st)) {
+    char s[16]; str_from_jsv(st, s, sizeof(s));
+    const char *runTxt = xfsm_status_to_text(XFSM_STATUS_RUNNING);
+    running = (0 == strcmp(s, runTxt));
+  }
   if (st) jsvUnLock(st);
   if (!running) return 0;
 
@@ -1296,11 +1366,11 @@ JsVar *xfsm_service_send(JsVar *svc, JsVar *event /*string or object*/) {
     JsVar *pv = jsvObjectGetChild(prev, S_VALUE, 0);
     if (pv && jsvIsString(pv)) str_from_jsv(pv, fromBuf, sizeof(fromBuf));
     if (pv) jsvUnLock(pv);
-    jsvUnLock(prev);
   }
 
   /* compute next pure state */
-  JsVar *next = xfsm_machine_transition_ex(m, 0 /*use svc state via fromBuf if needed in ex*/, evtObj);
+  JsVar *next = xfsm_machine_transition_ex(m, prev /*current state object*/, evtObj);
+  if (prev) jsvUnLock(prev);
   if (!next) { jsvUnLock(evtObj); jsvUnLock(m); return 0; }
 
   /* execute actions */
@@ -1344,7 +1414,7 @@ JsVar *xfsm_service_get_state(JsVar *svc) {
 JsVar *xfsm_service_get_status(JsVar *svc) {
   if (!svc) return 0;
   JsVar *v = jsvObjectGetChild(svc, K_SSTATUS, 0);
-  if (!v) return jsvNewFromString("NotStarted");
+  if (!v) return jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_NOTSTARTED));
   return v; // locked
 }
 
@@ -1359,9 +1429,24 @@ JsVar *xfsm_service_get_status_num(JsVar *svc) {
   int num = 0;
   if (v && jsvIsString(v)) {
     char s[16]; str_from_jsv(v, s, sizeof(s));
-    if (0 == strcmp(s, "Running")) num = 1;
-    else if (0 == strcmp(s, "Stopped")) num = 2;
+    const char *runTxt = xfsm_status_to_text(XFSM_STATUS_RUNNING);
+    const char *stpTxt = xfsm_status_to_text(XFSM_STATUS_STOPPED);
+    if (0 == strcmp(s, runTxt)) num = 1;
+    else if (0 == strcmp(s, stpTxt)) num = 2;
   }
   if (v) jsvUnLock(v);
   return jsvNewFromInteger(num);
+}
+/* ---------------- Status text mapping (single-copy strings) --------------- */
+static const char XFSM_TXT_NOTSTARTED[] = "NotStarted";
+static const char XFSM_TXT_RUNNING[]    = "Running";
+static const char XFSM_TXT_STOPPED[]    = "Stopped";
+
+const char *xfsm_status_to_text(XfsmStatus st) {
+  switch (st) {
+    case XFSM_STATUS_RUNNING:    return XFSM_TXT_RUNNING;
+    case XFSM_STATUS_STOPPED:    return XFSM_TXT_STOPPED;
+    case XFSM_STATUS_NOTSTARTED:
+    default:                     return XFSM_TXT_NOTSTARTED;
+  }
 }

@@ -221,14 +221,16 @@ function T_REQ_FSM_08() {
           NOP:{ actions:[ tracer(trace,"nop") ] }
         }
       },
-      B:{ entry:[ tracer(trace,"entryB") ] }
+      B:{ entry:[ tracer(trace,"entryB") ], on:{ NOP:{ actions:[ tracer(trace,"nop") ] } } }
     }
   });
   var s = m.interpret().start();
   s.send("GO");
   var ord = trace.join(",");
   var ok1 = (ord==="exitA,trans,entryB");
-  trace=[];
+  // Important: keep the same array object so closures continue to push into it
+  // Use splice() to avoid Espruino treating length as non-writable
+  trace.splice(0, trace.length);
   s.send("NOP");
   var ok2 = (s.state.value==="B" && trace.join(",")==="nop");
   if (ok1 && ok2) return pass("REQ-FSM-08", "targeted (exit→trans→entry) and targetless handled");

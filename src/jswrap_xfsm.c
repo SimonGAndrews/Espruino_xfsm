@@ -14,8 +14,6 @@
 #include "jsparse.h"
 #include <string.h>
 
-static const char * const K_SSTATE  = "_state";
-
 
 /* ========================================================================== */
 /*                              FSM (V1)                                      */
@@ -57,13 +55,13 @@ JsVar *jswrap_xfsm_constructor(JsVar *config) {
   "return"   : ["JsVar", "Current FSM status string"]
 }*/
 JsVar *jswrap_xfsm_start(JsVar *parent, JsVar *initialState) {
-  if (!jsvIsObject(parent)) return jsvNewFromString("NotStarted");
+  if (!jsvIsObject(parent)) return jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_NOTSTARTED));
 
   JsVar *stateToSet = 0;
   if (initialState && !jsvIsUndefined(initialState) && !jsvIsNull(initialState)) {
     if (!jsvIsString(initialState)) {
       jsExceptionHere(JSET_ERROR, "FSM.start: initialState must be a string");
-      return jsvNewFromString("NotStarted");
+      return jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_NOTSTARTED));
     }
     stateToSet = jsvLockAgain(initialState);
   }
@@ -71,10 +69,7 @@ JsVar *jswrap_xfsm_start(JsVar *parent, JsVar *initialState) {
   XfsmStatus st = xfsm_start_object(parent, stateToSet);
   if (stateToSet) jsvUnLock(stateToSet);
 
-  return (st == XFSM_STATUS_RUNNING)
-           ? jsvNewFromString("Running")
-           : (st == XFSM_STATUS_STOPPED ? jsvNewFromString("Stopped")
-                                        : jsvNewFromString("NotStarted"));
+  return jsvNewFromString(xfsm_status_to_text(st));
 }
 
 /*JSON{
@@ -98,12 +93,9 @@ JsVar *jswrap_xfsm_stop(JsVar *parent) {
   "return"   : ["JsVar", "Current FSM status string"]
 }*/
 JsVar *jswrap_xfsm_statusText(JsVar *parent) {
-  if (!jsvIsObject(parent)) return jsvNewFromString("NotStarted");
+  if (!jsvIsObject(parent)) return jsvNewFromString(xfsm_status_to_text(XFSM_STATUS_NOTSTARTED));
   XfsmStatus st = xfsm_status_object(parent);
-  return (st == XFSM_STATUS_RUNNING)
-           ? jsvNewFromString("Running")
-           : (st == XFSM_STATUS_STOPPED ? jsvNewFromString("Stopped")
-                                        : jsvNewFromString("NotStarted"));
+  return jsvNewFromString(xfsm_status_to_text(st));
 }
 
 /*JSON{
@@ -330,9 +322,8 @@ JsVar *jswrap_service_subscribe(JsVar *svc, JsVar *listener) {
     jsvUnLock(listeners);
   }
 
-    // Queue pre-notify (already correct)
-  JsVar *st = jsvObjectGetChild(svc, K_SSTATE, 0);
-  if (!st) st = xfsm_service_get_state(svc);
+  // Queue pre-notify using public accessor (avoid private _state coupling)
+  JsVar *st = xfsm_service_get_state(svc);
   if (st) {
     JsVar *argv[1] = { st };
     jsiQueueEvents(svc, listener, argv, 1);
