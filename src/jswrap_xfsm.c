@@ -150,6 +150,12 @@ JsVar *jswrap_xfsm_send(JsVar *parent, JsVar *event) {
   "return":["JsVar","Machine instance"]
 }*/
 JsVar *jswrap_machine_constructor(JsVar *config, JsVar *options) {
+  if (config && jsvIsObject(config)) {
+    if (!xfsm_validate_no_nested_states(config)) {
+      jsExceptionHere(JSET_ERROR, "Machine: nested states are not supported in this build");
+      return 0;
+    }
+  }
   JsVar *obj = jspNewObject(0, "Machine");
   if (!obj) return 0;
   jsvObjectSetChildAndUnLock(obj, "config", (config && jsvIsObject(config)) ? jsvLockAgain(config) : jsvNewObject());
@@ -239,8 +245,8 @@ JsVar *jswrap_service_send(JsVar *parent, JsVar *event) {
     return jsvLockAgain(parent);
   }
   JsVar *st = xfsm_service_send(parent, event); // returns 0 or a *locked* string
-  if (st) return st;
-  return jsvLockAgain(parent); // chainable when no transition
+  if (st) jsvUnLock(st);
+  return jsvLockAgain(parent); // always chainable
 }
 
 /*JSON{
