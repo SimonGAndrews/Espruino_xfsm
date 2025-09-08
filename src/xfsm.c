@@ -338,30 +338,9 @@ static JsVar *resolveFunc(JsVar *owner, JsVar *item /*locked*/) {
 /* ---------------- Built-in 'assign' support ---------------- */
 static bool is_string_eq(JsVar *v, const char *s) {
   if (!v || !jsvIsString(v)) return false;
-  char buf[32]; size_t n = jsvGetString(v, buf, sizeof(buf)-1); buf[n]=0;
+  char buf[32]; size_t n = jsvGetString(v, buf, sizeof(buf)-1); buf[n] = 0;
   return 0 == strcmp(buf, s);
 }
-
-/* Shallow-merge 'patch' object into *pCtx (no jsvGetKeys; use iterator) */
-static void merge_patch_into_ctx(JsVar **pCtx, JsVar *patch) {
-  if (!*pCtx || !jsvIsObject(*pCtx)) { if (*pCtx) jsvUnLock(*pCtx); *pCtx = jsvNewObject(); }
-
-  JsvObjectIterator it;
-  jsvObjectIteratorNew(&it, patch);
-  while (jsvObjectIteratorHasValue(&it)) {
-    JsVar *k = jsvObjectIteratorGetKey(&it);     /* locked */
-    JsVar *v = jsvObjectIteratorGetValue(&it);   /* locked */
-    if (k && jsvIsString(k) && v) {
-      char key[64]; size_t n = jsvGetString(k, key, sizeof(key)-1); key[n]=0;
-      jsvObjectSetChildAndUnLock(*pCtx, key, jsvLockAgain(v));
-    }
-    if (v) jsvUnLock(v);
-    if (k) jsvUnLock(k);
-    jsvObjectIteratorNext(&it);
-  }
-  jsvObjectIteratorFree(&it);
-}
-
 
 /* Apply an 'assignment' spec (function or object) to produce a patch and merge */
 static void apply_assignment(JsVar *svc, JsVar **pCtx, JsVar *assignAction, JsVar *eventObj) {
