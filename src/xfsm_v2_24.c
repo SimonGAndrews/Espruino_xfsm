@@ -16,7 +16,7 @@
 //   V1 FSM (single-object): xfsm_init_object, xfsm_start_object, xfsm_stop_object,
 //                           xfsm_status_object, xfsm_current_state_var, xfsm_send_object
 //   Machine (pure): xfsm_machine_init, xfsm_machine_initial_state,
-//                   xfsm_machine_state_for_value, xfsm_machine_transition
+//                   xfsm_machine_transition
 //   Service/Interpreter (stateful): xfsm_service_init, xfsm_service_start, xfsm_service_stop,
 //                                   xfsm_service_send, xfsm_service_get_state, xfsm_service_get_status
 //

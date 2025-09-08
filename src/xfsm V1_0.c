@@ -15,7 +15,7 @@
 //   V1 FSM (single-object): xfsm_init_object, xfsm_start_object, xfsm_stop_object,
 //                           xfsm_status_object, xfsm_current_state_var, xfsm_send_object
 //   Machine (pure): xfsm_machine_init, xfsm_machine_initial_state,
-//                   xfsm_machine_state_for_value, xfsm_machine_transition
+//                   xfsm_machine_transition
 //   Service/Interpreter (stateful): xfsm_service_init, xfsm_service_start, xfsm_service_stop,
 //                                   xfsm_service_send, xfsm_service_get_state, xfsm_service_get_status
 //
@@ -502,23 +502,6 @@ JsVar *xfsm_machine_initial_state(JsVar *m) {
   return st; // locked
 }
 
-JsVar *xfsm_machine_state_for_value(JsVar *m, JsVar *valueStr /*locked string*/) {
-  if (!m || !valueStr || !jsvIsString(valueStr)) return 0;
-  char val[64]=""; str_from_jsv(valueStr,val,sizeof(val));
-  JsVar *cfg = getChildObj(m, K_CFG); if (!cfg) return 0;
-  JsVar *ctx = jsvObjectGetChild(cfg, K_CONTEXT, 0); // may be 0
-  JsVar *states = getChildObj(cfg, K_STATES);
-  JsVar *node = (states) ? jsvObjectGetChild(states, val, 0) : 0;
-  JsVar *entryActs = (node && jsvIsObject(node)) ? getActionListRaw(node, K_ENTRY) : 0;
-  if (node) jsvUnLock(node);
-  if (states) jsvUnLock(states);
-  JsVar *st = new_state_obj(val, ctx, entryActs);
-  if (entryActs) jsvUnLock(entryActs);
-  if (ctx) jsvUnLock(ctx);
-  jsvUnLock(cfg);
-  return st;
-}
-
 JsVar *xfsm_machine_transition(JsVar *m, JsVar *stateOrValue, JsVar *eventStr) {
   if (!m || !eventStr || !jsvIsString(eventStr)) return 0;
 
@@ -649,9 +632,7 @@ void xfsm_service_start(JsVar *svc, JsVar *initialValue /*string or 0*/) {
   JsVar *m = jsvObjectGetChild(svc, K_MACHINE, 0);
   if (!m) return;
 
-  JsVar *st = 0;
-  if (initialValue && jsvIsString(initialValue)) st = xfsm_machine_state_for_value(m, initialValue);
-  else st = xfsm_machine_initial_state(m);
+  JsVar *st = xfsm_machine_initial_state(m);
   if (!st) { jsvUnLock(m); return; }
 
   /* Read raw actions and value BEFORE storing st on service */

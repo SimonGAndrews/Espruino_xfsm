@@ -28,7 +28,6 @@ JsVar     *xfsm_send_object(JsVar *fsmObject, JsVar *event /*locked string*/);
 */
 void   xfsm_machine_init(JsVar *machineObj); // ensures structure; does not compute/store initial
 JsVar *xfsm_machine_initial_state(JsVar *machineObj); // locked state obj
-JsVar *xfsm_machine_state_for_value(JsVar *machineObj, JsVar *valueStr /*locked string*/); // entry actions for given value
 JsVar *xfsm_machine_transition(JsVar *machineObj, JsVar *stateOrValue /*state obj or string*/, JsVar *eventStr /*string*/); // locked state obj
 
 /* ---------------- Service (stateful interpreter) ----------------
