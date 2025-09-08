@@ -16,7 +16,7 @@
 //   V1 FSM (single-object): xfsm_init_object, xfsm_start_object, xfsm_stop_object,
 //                           xfsm_status_object, xfsm_current_state_var, xfsm_send_object
 //   Machine (pure): xfsm_machine_init, xfsm_machine_initial_state,
-//                   xfsm_machine_state_for_value, xfsm_machine_transition
+//                   xfsm_machine_transition
 //   Service/Interpreter (stateful): xfsm_service_init, xfsm_service_start, xfsm_service_stop,
 //                                   xfsm_service_send, xfsm_service_get_state, xfsm_service_get_status
 //
@@ -828,60 +828,6 @@ JsVar *xfsm_machine_initial_state(JsVar *machine) {
 }
 
 /**
- * xfsm_machine_state_for_value
- * Build a state object for a given state value string.
- * Args:
- *   machineObj : JsVar* machine object
- *   valueStr   : JsVar* string (locked) naming the state value
- * Returns LOCKED { value, context, actions(entry[]), changed:false } or 0 on error.
- */
-JsVar *xfsm_machine_state_for_value(JsVar *machineObj, JsVar *valueStr /*locked string*/) {
-  if (!machineObj || !jsvIsObject(machineObj) || !valueStr || !jsvIsString(valueStr)) return 0;
-
-  /* Extract C string for the state value */
-  char valBuf[64] = "";
-  str_from_jsv(valueStr, valBuf, sizeof(valBuf));
-  if (!valBuf[0]) return 0;
-
-  /* config */
-  JsVar *cfg = jsvObjectGetChild(machineObj, K_CFG, 0);
-  if (!cfg) return 0;
-
-  /* states table */
-  JsVar *states = jsvObjectGetChild(cfg, K_STATES, 0);
-  if (!states || !jsvIsObject(states)) {
-    if (states) jsvUnLock(states);
-    jsvUnLock(cfg);
-    return 0;
-  }
-
-  /* node for 'valBuf' */
-  JsVar *node = jsvObjectGetChild(states, valBuf, 0);
-  if (!node || !jsvIsObject(node)) {
-    if (node) jsvUnLock(node);
-    jsvUnLock(states);
-    jsvUnLock(cfg);
-    return 0;
-  }
-
-  /* entry actions (may be array or single func) */
-  JsVar *entryActs = jsvObjectGetChild(node, K_ENTRY, 0);
-
-  /* machine-path context comes from config.context (service owns its own _context) */
-  JsVar *ctx = jsvObjectGetChild(cfg, K_CONTEXT, 0);
-
-  /* changed=false for a direct construct of a state object */
-  JsVar *st = new_state_obj(valBuf, ctx, entryActs, false);
-
-  if (ctx) jsvUnLock(ctx);
-  if (entryActs) jsvUnLock(entryActs);
-  jsvUnLock(node);
-  jsvUnLock(states);
-  jsvUnLock(cfg);
-  return st; /* LOCKED */
-}
-
- /**
  * xfsm_machine_transition (shim)
  * Keep backward-compat signature using string event.
  */
