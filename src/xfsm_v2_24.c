@@ -1,189 +1,413 @@
 // XFSM_UPLOAD_ID: 2025-08-23-14-00-native-subscribe
-// xfsm.c — Espruino JsVar-only FSM core with xstate-fsm alignment
+// jswrap_xfsm.c — Unified JavaScript wrappers for Espruino
+// Exposes 3 classes to JS:
+//   - FSM      (V1 compatibility, state stored on the instance)
+//   - Machine  (pure, creates state objects and Services)
+//   - Service  (interpreter; runs actions/guards; maintains its own status/context)
 
-// Highlights
-// - Built-in action: `assign` (also accepts shorthand object without `type`)
-//   * { type:"xstate.assign", assignment: fn|object }  // preferred
-//   * { type:"assign", assignment: fn|object }         // alias
-//   * shorthand: { key: valueOrFn, ... }               // treated as assignment spec
-//   Semantics: produces a patch (object) which is shallow-merged into context.
-// - Actions list items may be: function, string (resolved via config.actions then global), or assign object.
-// - Guards (cond) are functions or strings; truthiness via jsvGetBool.
-// - Context persistence happens ONCE after executing a group of actions.
-// - No C++ features; strict JsVar lock/unlock discipline.
-
-// Public API (declared in xfsm.h):
-//   V1 FSM (single-object): xfsm_init_object, xfsm_start_object, xfsm_stop_object,
-//                           xfsm_status_object, xfsm_current_state_var, xfsm_send_object
-//   Machine (pure): xfsm_machine_init, xfsm_machine_initial_state,
-//                   xfsm_machine_state_for_value, xfsm_machine_transition
-//   Service/Interpreter (stateful): xfsm_service_init, xfsm_service_start, xfsm_service_stop,
-//                                   xfsm_service_send, xfsm_service_get_state, xfsm_service_get_status
-//
-// NOTE: Keep 'persist once' rule to avoid jsvUnLockInline asserts.
-
-
-#include "jsutils.h"
-#include "jsinteractive.h"
-#include "jsparse.h"  // jspEvaluateVar
-#include "jsvar.h"
-
+#include "jswrapper.h"  
+#include "jswrap_xfsm.h"
 #include "xfsm.h"
-#include <string.h>
-#include <stddef.h>
-#include <stdbool.h>
-#include <jswrapper.h>
-
-
-// --- One-time unsubscribe factory (closure-based, strong delete) ---
-
-static JsVar *xfsm_unsub_factory = 0;
-
-void xfsm_ensure_unsub_factory(void) {
-  if (xfsm_unsub_factory && jsvIsFunction(xfsm_unsub_factory)) return;
-
-  // (function(m,i){ i=''+i; return function(){ try{ return m._unsubById(i); }catch(e){ return false; } }; })
-  JsVar *src = jsvNewFromString(
-    "(function(m,i){"
-      "i = ''+i;"
-      "return function(){"
-        "try { return m._unsubById(i); }"
-        "catch(e){ return false; }"
-      "};"
-    "})"
-  );
-  if (!src) return;
-
-  JsVar *fn = jspEvaluateVar(src, 0 /*global*/, "xfsm.unsubFactory");
-  jsvUnLock(src);
-
-  if (fn && jsvIsFunction(fn)) xfsm_unsub_factory = fn;
-  else { if (fn) jsvUnLock(fn); xfsm_unsub_factory = 0; }
-}
-
-
-// Create a fresh unsubscribe() that closes over svc + id (stringified inside the factory).
-// Returns a LOCKED function.
-JsVar *xfsm_make_unsubscribe(JsVar *svc, int id) {
-  if (!(xfsm_unsub_factory && jsvIsFunction(xfsm_unsub_factory)))
-    return jsvNewNativeFunction((void (*)(void))0, JSWAT_VOID);
-
-  JsVar *factory = jsvLockAgain(xfsm_unsub_factory);
-  JsVar *a0 = jsvLockAgain(svc);
-  JsVar *a1 = jsvNewFromInteger(id);
-  JsVar *argv[2] = { a0, a1 };
-
-  JsVar *fn = jspExecuteFunction(factory, 0 /*this*/, 2, argv);
-
-  jsvUnLock(a0);
-  jsvUnLock(a1);
-  jsvUnLock(factory);
-
-  if (fn && jsvIsFunction(fn)) return fn; // LOCKED
-  if (fn) jsvUnLock(fn);
-  return jsvNewNativeFunction((void (*)(void))0, JSWAT_VOID);
-}
-
-
-
-/* ---------------- Event normalization ---------------- */
-// Enable events to be recieved as strings or objects.  
-
-JsVar *xfsm_normalize_event(JsVar *event) {
-  if (!event) return 0;
-
-  if (jsvIsString(event)) {
-    JsVar *obj = jsvNewObject();
-    if (!obj) return 0;
-    /* jsvAsString takes a single argument in this tree */
-    JsVar *t = jsvAsString(event);          /* LOCKED string */
-    if (!t) t = jsvNewFromString("");       /* fallback */
-    jsvObjectSetChildAndUnLock(obj, "type", t);
-    return obj;                              /* LOCKED */
-  }
-
-  if (jsvIsObject(event)) {
-    JsVar *t = jsvObjectGetChild(event, "type", 0);
-    if (!t || !jsvIsString(t)) {
-      if (t) jsvUnLock(t);
-      jsvObjectSetChildAndUnLock(event, "type", jsvNewFromString(""));
-    } else {
-      jsvUnLock(t);
-    }
-    return jsvLockAgain(event);              /* LOCKED */
-  }
-
-  return 0;
-}
-
-/* ---------------- Key strings ---------------- */
-static const char * const K_STATUS  = "status";
-static const char * const K_STATE   = "state";
-static const char * const K_CFG     = "config";
-
-static const char * const K_STATES  = "states";
-static const char * const K_ON      = "on";
-static const char * const K_ENTRY   = "entry";
-static const char * const K_EXIT    = "exit";
-static const char * const K_TARGET  = "target";
-static const char * const K_ACTIONS = "actions";
-static const char * const K_CONTEXT = "context";
-static const char * const K_COND    = "cond";
-
-/* Machine state object fields */
-static const char * const S_VALUE   = "value";
-static const char * const S_CTX     = "context";
-static const char * const S_ACTS    = "actions";
-
-/* Service fields */
-static const char * const K_MACHINE = "_machine";
-static const char * const K_SSTATE  = "_state";
-static const char * const K_SCTX    = "_context";
-static const char * const K_SSTATUS = "_status";
-
-/* ---------------- Function invocation helper ---------------- */
-static JsVar *xfsm_callJsFunction(JsVar *fn, JsVar *thisArg, JsVar **argv, int argc) {
-  if (!fn || !jsvIsFunction(fn)) return 0;
-  JsVar *thisObj = thisArg ? jsvLockAgain(thisArg) : jsvNewNull();
-  JsVar *res = jspExecuteFunction(fn, thisObj, argc, argv); // locked or 0
-  jsvUnLock(thisObj);
-  return res;
-}
-
-/** Notify all registered listeners with the current state (argument 0). */
+#include "jsvar.h"
 #include "jsutils.h"
 #include "jsinteractive.h"
 #include "jsparse.h"
-#include "jsvar.h"
-#include "xfsm.h"
+#include <string.h>
 
-/** Notify all registered listeners with the current state (argument 0). */
-void xfsm_notify_listeners(JsVar *service) {
-  if (!service || !jsvIsObject(service)) return;
+static const char * const K_SSTATE  = "_state";
 
-  JsVar *listeners = jsvObjectGetChild(service, "_listeners", 0);
-  if (!listeners || !jsvIsObject(listeners)) { if (listeners) jsvUnLock(listeners); return; }
 
-  // Prefer backing state; fall back to getter if missing
-  JsVar *st = jsvObjectGetChild(service, K_SSTATE, 0);
-  if (!st) st = xfsm_service_get_state(service); // LOCKED or 0
+/* ========================================================================== */
+/*                              FSM (V1)                                      */
+/* ========================================================================== */
 
-  JsvObjectIterator it;
-  jsvObjectIteratorNew(&it, listeners);
-  while (jsvObjectIteratorHasValue(&it)) {
-    JsVar *k  = jsvObjectIteratorGetKey(&it);
-    JsVar *fn = jsvObjectIteratorGetValue(&it);
-    jsvUnLock(k);
-    if (fn && jsvIsFunction(fn) && st) {
-      JsVar *argv[1] = { st };
-      JsVar *res = jspExecuteFunction(fn, service, 1, argv);
-      if (res) jsvUnLock(res);
+/*JSON{
+  "type"  : "class",
+  "class" : "FSM",
+  "name"  : "FSM"
+}*/
+
+/*JSON{
+  "type"     : "constructor",
+  "class"    : "FSM",
+  "name"     : "FSM",
+  "generate" : "jswrap_xfsm_constructor",
+  "params"   : [["config", "JsVar", "FSM configuration object"]],
+  "return"   : ["JsVar", "A new FSM instance"]
+}*/
+JsVar *jswrap_xfsm_constructor(JsVar *config) {
+  JsVar *obj = jspNewObject(0, "FSM");
+  if (!obj) return 0;
+
+  // Store config (copy or empty object)
+  JsVar *cfg = (config && jsvIsObject(config)) ? jsvLockAgain(config) : jsvNewObject();
+  jsvObjectSetChildAndUnLock(obj, "config", cfg);
+
+  // Initialise defaults
+  xfsm_init_object(obj);
+  return obj;
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "FSM",
+  "name"     : "start",
+  "generate" : "jswrap_xfsm_start",
+  "params"   : [["initialState", "JsVar", "[optional] initial state string"]],
+  "return"   : ["JsVar", "Current FSM status string"]
+}*/
+JsVar *jswrap_xfsm_start(JsVar *parent, JsVar *initialState) {
+  if (!jsvIsObject(parent)) return jsvNewFromString("NotStarted");
+
+  JsVar *stateToSet = 0;
+  if (initialState && !jsvIsUndefined(initialState) && !jsvIsNull(initialState)) {
+    if (!jsvIsString(initialState)) {
+      jsExceptionHere(JSET_ERROR, "FSM.start: initialState must be a string");
+      return jsvNewFromString("NotStarted");
     }
-    if (fn) jsvUnLock(fn);
-    jsvObjectIteratorNext(&it);
+    stateToSet = jsvLockAgain(initialState);
   }
-  jsvObjectIteratorFree(&it);
 
-  if (st) jsvUnLock(st);
+  XfsmStatus st = xfsm_start_object(parent, stateToSet);
+  if (stateToSet) jsvUnLock(stateToSet);
+
+  return (st == XFSM_STATUS_RUNNING)
+           ? jsvNewFromString("Running")
+           : (st == XFSM_STATUS_STOPPED ? jsvNewFromString("Stopped")
+                                        : jsvNewFromString("NotStarted"));
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "FSM",
+  "name"     : "stop",
+  "generate" : "jswrap_xfsm_stop",
+  "return"   : ["JsVar", "undefined"]
+}*/
+JsVar *jswrap_xfsm_stop(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  xfsm_stop_object(parent);
+  return 0; // undefined
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "FSM",
+  "name"     : "statusText",
+  "generate" : "jswrap_xfsm_statusText",
+  "return"   : ["JsVar", "Current FSM status string"]
+}*/
+JsVar *jswrap_xfsm_statusText(JsVar *parent) {
+  if (!jsvIsObject(parent)) return jsvNewFromString("NotStarted");
+  XfsmStatus st = xfsm_status_object(parent);
+  return (st == XFSM_STATUS_RUNNING)
+           ? jsvNewFromString("Running")
+           : (st == XFSM_STATUS_STOPPED ? jsvNewFromString("Stopped")
+                                        : jsvNewFromString("NotStarted"));
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "FSM",
+  "name"     : "current",
+  "generate" : "jswrap_xfsm_current",
+  "return"   : ["JsVar", "Current FSM state string or undefined"]
+}*/
+JsVar *jswrap_xfsm_current(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  return xfsm_current_state_var(parent); // locked or 0
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "FSM",
+  "name"     : "send",
+  "generate" : "jswrap_xfsm_send",
+  "params"   : [["event", "JsVar", "Event string"]],
+  "return"   : ["JsVar", "New state string or undefined if no transition"]
+}*/
+JsVar *jswrap_xfsm_send(JsVar *parent, JsVar *event) {
+  if (!jsvIsObject(parent)) return 0;
+  if (!event || !jsvIsString(event)) {
+    jsExceptionHere(JSET_ERROR, "FSM.send: event must be a string");
+    return 0;
+  }
+  return xfsm_send_object(parent, event); // locked or 0
+}
+
+/* ========================================================================== */
+/*                              Machine (pure)                                */
+/* ========================================================================== */
+
+/*JSON{
+  "type":"class", "class":"Machine", "name":"Machine"
+}*/
+
+/*JSON{
+  "type":"constructor","class":"Machine","name":"Machine",
+  "generate":"jswrap_machine_constructor",
+  "params":[["config","JsVar","FSM config object"],["options","JsVar","[optional] options (unused yet)"]],
+  "return":["JsVar","Machine instance"]
+}*/
+JsVar *jswrap_machine_constructor(JsVar *config, JsVar *options) {
+  JsVar *obj = jspNewObject(0, "Machine");
+  if (!obj) return 0;
+  jsvObjectSetChildAndUnLock(obj, "config", (config && jsvIsObject(config)) ? jsvLockAgain(config) : jsvNewObject());
+  if (options && jsvIsObject(options))
+    jsvObjectSetChildAndUnLock(obj, "_options", jsvLockAgain(options));
+  else
+    jsvObjectSetChildAndUnLock(obj, "_options", jsvNewObject());
+  xfsm_machine_init(obj);
+  return obj;
+}
+
+/*JSON{
+  "type":"method","class":"Machine","name":"initialState",
+  "generate":"jswrap_machine_initialState",
+  "return":["JsVar","State object {value,context,actions}"]
+}*/
+JsVar *jswrap_machine_initialState(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  return xfsm_machine_initial_state(parent);
+}
+
+/*JSON{
+  "type":"method","class":"Machine","name":"transition",
+  "generate":"jswrap_machine_transition",
+  "params":[["stateOrValue","JsVar","Current state object or value string"],["event","JsVar","Event string"]],
+  "return":["JsVar","Next state object or undefined"]
+}*/
+JsVar *jswrap_machine_transition(JsVar *parent, JsVar *stateOrValue, JsVar *eventStr) {
+  if (!jsvIsObject(parent) || !eventStr || !jsvIsString(eventStr)) return 0;
+  return xfsm_machine_transition(parent, stateOrValue, eventStr);
+}
+
+/*JSON{
+  "type":"method","class":"Machine","name":"interpret",
+  "generate":"jswrap_machine_interpret",
+  "return":["JsVar","A new Service interpreter"]
+}*/
+JsVar *jswrap_machine_interpret(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  JsVar *svc = jspNewObject(0, "Service");
+  if (!svc) return 0;
+  xfsm_service_init(svc, parent);
+  return svc;
+}
+
+/* ========================================================================== */
+/*                              Service (interpreter)                          */
+/* ========================================================================== */
+
+/*JSON{
+  "type":"class", "class":"Service", "name":"Service"
+}*/
+
+/*JSON{
+  "type":"method","class":"Service","name":"start",
+  "generate":"jswrap_service_start",
+  "return":["JsVar","this"]
+}*/
+JsVar *jswrap_service_start(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  JsVar *r = xfsm_service_start(parent);
+  if (r) jsvUnLock(r);           // underlying returns service; wrapper should still return `this`
+  return jsvLockAgain(parent);   // chainable
+}
+
+/*JSON{
+  "type":"method","class":"Service","name":"stop",
+  "generate":"jswrap_service_stop",
+  "return":["JsVar","this"]
+}*/
+JsVar *jswrap_service_stop(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  xfsm_service_stop(parent);
+  return jsvLockAgain(parent); // return a locked 'this'
+}
+
+/*JSON{
+  "type":"method","class":"Service","name":"send",
+  "generate":"jswrap_service_send",
+  "params":[["event","JsVar","Event string or object {type,...}"]],
+  "return":["JsVar","New state value string or this (chainable)"]
+}*/
+JsVar *jswrap_service_send(JsVar *parent, JsVar *event) {
+  if (!jsvIsObject(parent)) return 0;
+  if (!event || !(jsvIsString(event) || jsvIsObject(event))) {
+    jsExceptionHere(JSET_ERROR, "Service.send: event must be a string or an object with a type");
+    return jsvLockAgain(parent);
+  }
+  JsVar *st = xfsm_service_send(parent, event); // returns 0 or a *locked* string
+  if (st) return st;
+  return jsvLockAgain(parent); // chainable when no transition
+}
+
+/*JSON{
+  "type":"property",
+  "class":"Service",
+  "name":"state",
+  "generate":"jswrap_service_get_state",
+  "return":["JsVar","Current state object (locked)"]
+}*/
+JsVar *jswrap_service_get_state(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  return xfsm_service_get_state(parent);  // returns LOCKED state object
+}
+
+/*JSON{
+  "type":"property",
+  "class":"Service",
+  "name":"status",
+  "generate":"jswrap_service_get_status",
+  "return":["int","0=NotStarted, 1=Running, 2=Stopped"]
+}*/
+int jswrap_service_get_status(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  int out = 0;
+  JsVar *v = xfsm_service_get_status_num(parent);  // returns a LOCKED integer JsVar
+  if (v) {
+    out = (int)jsvGetInteger(v);
+    jsvUnLock(v);
+  }
+  return out;
+}
+
+
+/*JSON{
+  "type":"method","class":"Service","name":"statusText",
+  "generate":"jswrap_service_statusText",
+  "return":["JsVar","Current status string"]
+}*/
+JsVar *jswrap_service_statusText(JsVar *parent) {
+  if (!jsvIsObject(parent)) return 0;
+  return xfsm_service_get_status(parent);
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "Service",
+  "name"     : "subscribe",
+  "generate" : "jswrap_service_subscribe",
+  "params"   : [
+    ["listener","JsVar","function(state)"]
+  ],
+  "return"   : ["JsVar","unsubscribe function (LOCKED)"]
+}*/
+JsVar *jswrap_service_subscribe(JsVar *svc, JsVar *listener) {
+  if (!jsvIsObject(svc)) return 0;
+
+  // Invalid -> native no-op (no parser)
+  if (!listener || !jsvIsFunction(listener)) {
+    return jsvNewNativeFunction((void (*)(void))0, JSWAT_VOID);
+  }
+
+  // Ensure _listeners exists (keep local handle LOCKED)
+  JsVar *listeners = jsvObjectGetChild(svc, "_listeners", 0);
+  if (!listeners) {
+    listeners = jsvNewObject();
+    if (listeners) jsvObjectSetChild(svc, "_listeners", listeners); // NOTE: no 'AndUnLock' here
+  }
+
+  // id++
+  int id = 0;
+  JsVar *vlid = jsvObjectGetChild(svc, "_lid", 0);
+  if (vlid) { id = (int)jsvGetInteger(vlid); jsvUnLock(vlid); }
+  id = id + 1;
+  jsvObjectSetChildAndUnLock(svc, "_lid", jsvNewFromInteger(id));
+
+  // store listener under decimal key
+  if (listeners) {
+    char key[12];
+    itostr((JsVarInt)id, key, 10);
+    jsvObjectSetChildAndUnLock(listeners, key, jsvLockAgain(listener));
+    jsvUnLock(listeners);
+  }
+
+    // Queue pre-notify (already correct)
+  JsVar *st = jsvObjectGetChild(svc, K_SSTATE, 0);
+  if (!st) st = xfsm_service_get_state(svc);
+  if (st) {
+    JsVar *argv[1] = { st };
+    jsiQueueEvents(svc, listener, argv, 1);
+    jsvUnLock(st);
+  }
+
+  // Return closure-based unsubscribe (NO _svc/_id props, NO callee)
+return xfsm_make_unsubscribe(svc, id); // LOCKED
+}
+
+/*JSON{
+  "type"     : "method",
+  "class"    : "Service",
+  "name"     : "_unsubById",
+  "generate" : "jswrap_service_unsubById",
+  "params"   : [["id","JsVar","string listener id"]],
+  "return"   : ["bool","true if removed/neutralised"]
+}*/
+bool jswrap_service_unsubById(JsVar *svc, JsVar *idVar) {
+  if (!jsvIsObject(svc) || !idVar) return false;
+
+  JsVar *listeners = jsvObjectGetChild(svc, "_listeners", 0);
+  if (!listeners || !jsvIsObject(listeners)) {
+    if (listeners) jsvUnLock(listeners);
+    return false;
+  }
+
+  // Normalise the key to a string
+  JsVar *keyVar = jsvAsString(idVar);           // LOCKED
+  if (!keyVar) { jsvUnLock(listeners); return false; }
+
+  char delKey[16];
+  int  delLen = jsvGetString(keyVar, delKey, sizeof(delKey)-1);
+  if (delLen < 0) delLen = 0;
+  delKey[delLen] = 0;
+
+  bool existed = false;
+
+  // Did it exist before?
+  JsVar *existing = jsvObjectGetChild(listeners, delKey, 0);
+  if (existing) { existed = true; jsvUnLock(existing); }
+
+  // Attempt native removal (void return on your build)
+  jsvObjectRemoveChild(listeners, keyVar);
+
+  // Verify if it’s gone
+  JsVar *still = jsvObjectGetChild(listeners, delKey, 0);
+  if (still) {
+    // Rebuild map WITHOUT the key (guaranteed removal for enumeration & callbacks)
+    jsvUnLock(still);
+
+    JsVar *nl = jsvNewObject();
+    if (nl) {
+      JsvObjectIterator it;
+      jsvObjectIteratorNew(&it, listeners);
+      while (jsvObjectIteratorHasValue(&it)) {
+        JsVar *k = jsvObjectIteratorGetKey(&it);    // LOCKED
+        JsVar *v = jsvObjectIteratorGetValue(&it);  // LOCKED
+
+        // Extract key as C string
+        char kbuf[16];
+        int klen = jsvGetString(k, kbuf, sizeof(kbuf)-1);
+        if (klen < 0) klen = 0;
+        kbuf[klen] = 0;
+
+        if (strcmp(kbuf, delKey) != 0) {
+          jsvObjectSetChildAndUnLock(nl, kbuf, jsvLockAgain(v));
+        }
+
+        jsvUnLock(k);
+        jsvUnLock(v);
+        jsvObjectIteratorNext(&it);
+      }
+      jsvObjectIteratorFree(&it);
+
+      // Replace listeners map
+      jsvObjectSetChildAndUnLock(svc, "_listeners", nl);
+    }
+  }
+
+  jsvUnLock(keyVar);
   jsvUnLock(listeners);
+  return existed; // true if we removed or neutralised an existing entry
 }

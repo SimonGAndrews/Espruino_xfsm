@@ -2,12 +2,10 @@
 
 This document reviews the implemented functionality in the Espruino XFSM library against the requirements in `docs/xfsm_Requirements_v2.md` and identifies gaps, with concrete code references.
 
-
 ## Summary
 
 - Overall the Machine/Service core matches much of the `xstate-fsm` subset: event normalization, transition selection (including arrays and guards), action execution (functions, objects, named actions), built‑in `assign`, initial actions executed on `start()`, interpreter lifecycle, and subscription semantics.
 - Key gaps remain around targetless transition sequencing, assign‑first semantics, unchanged/no‑match return behavior, the `changed` flag, strict rejection of nested states, initial entry action normalization, and the JS `Service.send()` return type.
-
 
 ## Detailed Assessment by Requirement
 
@@ -104,7 +102,6 @@ Below, each requirement is marked as Met / Partial / Gap with supporting notes.
   - Subscribe uses queued immediate callback and returns a function; stop clears listeners; send ignored unless Running. References: `src/jswrap_xfsm.c:213`, `src/xfsm.c:1162`, `src/xfsm.c:1182`.
   - Gap: `send()` return type (see REQ‑FSM‑13) and unchanged/no‑match notification (see REQ‑FSM‑11/10).
 
-
 ## Additional Notes (Legacy V1 FSM)
 
 - V1 `xfsm_send_object` rejects targetless transitions (returns 0). References: `src/xfsm.c:754`.
@@ -112,42 +109,47 @@ Below, each requirement is marked as Met / Partial / Gap with supporting notes.
 
 These do not block Phase‑1 parity (focus is Machine/Service) but are worth documenting.
 
-
 ## Recommended Changes (Prioritized)
 
 1) Targetless sequencing
+
 - Only include `transition.actions` when `target` is absent; skip `exit[]` and `entry[]`. References: `src/xfsm.c:858` (composition) and where `exitArr`/`entryArr` are pushed.
 
 2) Assign‑first execution
+
 - In `run_actions_raw`, split the pass: first apply all `assign` actions to `ctx`, then execute remaining non‑assign actions in listed order. Apply the same policy for initial `entry` actions.
 
 3) Initial `entry` normalization
+
 - Ensure `initialState().actions` is an array. If the config’s `entry` is a single action, wrap it into a single‑element array so `Service.start()` executes it. References: `src/xfsm.c:821`, `src/xfsm.c:1125`.
 
 4) Unchanged/no‑match behavior
+
 - When no transition matches, return an unchanged state `{ value: current, context, actions: [], changed: false }` (instead of `0`) and notify subscribers to maintain observable behavior. References: `src/xfsm.c:899`.
 
 5) `changed` semantics
+
 - Compute `changed = true` when:
   - `target !== current`, or
   - any non‑assign actions are present, or
   - any `assign` occurred (even targetless).
 
 6) Reject nested states
+
 - Convert `xfsm_validate_no_nested_states` into an enforced validation for machine initialization (throw/abort in dev builds) rather than logging only. References: `src/xfsm.c:231`.
 
 7) JS API consistency
+
 - Make `Service.send()` return `this` (chainable) consistently. Expose `new state value` via `service.state.value` for callers that need it. References: `src/jswrap_xfsm.c:184`.
 
 8) Optional: expose a helper (pure path)
-- Add a `createUnchangedState(value, context)` equivalent or implement the behavior inline where no match occurs.
 
+- Add a `createUnchangedState(value, context)` equivalent or implement the behavior inline where no match occurs.
 
 ## Espruino‑Specific Considerations
 
 - Diagnostics: Consider adding more `jsDebug(DBG_INFO, ...)` messages for invalid configs (`initial` missing, unknown `target`) to aid users.
 - Memory/perf: Add a burn‑in test harness to run `send()` loops and watch heap usage and timing.
-
 
 ## References (Files/Lines)
 
@@ -158,8 +160,6 @@ These do not block Phase‑1 parity (focus is Machine/Service) but are worth doc
 - JS wrappers: `src/jswrap_xfsm.c:146`, `src/jswrap_xfsm.c:167`, `src/jswrap_xfsm.c:184`, `src/jswrap_xfsm.c:213`, `src/jswrap_xfsm.c:260`.
 - Legacy FSM V1 specifics: `src/xfsm.c:431`, `src/xfsm.c:659`, `src/xfsm.c:754`.
 
-
 ## Conclusion
 
 Core behavior aligns with much of the `xstate-fsm` subset, but a few semantic differences must be addressed to claim full parity for Phase‑1. The most impactful changes are: fix targetless sequencing, enforce assign‑first semantics, normalize initial `entry` to arrays, return unchanged state on no match (and notify), compute `changed` per spec, and enforce flat machines. After these, revisit `Service.send()`’s return type for API consistency.
-
