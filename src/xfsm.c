@@ -442,6 +442,35 @@ static JsVar *getTransitionActionsRaw(JsVar *transitionObj) {
   return acts; // locked
 }
 
+/* Detect if an action item is 'assign'-like (xstate.assign/assign or shorthand object)
+ * Rules:
+ *  - { type: 'xstate.assign' | 'assign', ... }
+ *  - shorthand object (no exec, and either no type or non-string) => treat as assign spec
+ *  - Plain functions are NOT treated as assign here
+ */
+static bool is_assign_like(JsVar *item) {
+  if (!item || !jsvIsObject(item)) return false;
+  JsVar *typ = jsvObjectGetChild(item, "type", 0);
+  if (typ) {
+    if (jsvIsString(typ)) {
+      char tbuf[32];
+      int tlen = jsvGetString(typ, tbuf, sizeof(tbuf)-1);
+      if (tlen < 0) tlen = 0;
+      tbuf[tlen] = 0;
+      jsvUnLock(typ);
+      if (!strcmp(tbuf, "xstate.assign") || !strcmp(tbuf, "assign")) return true;
+      // has a non-assign type => not assign-like
+      return false;
+    }
+    jsvUnLock(typ);
+  }
+  // If it has an exec function, it's an explicit exec action, not shorthand assign
+  JsVar *exec = jsvObjectGetChild(item, "exec", 0);
+  if (exec) { jsvUnLock(exec); return false; }
+  // No type/exec => treat as shorthand assign object
+  return true;
+}
+
 /* Execute an array of actions against (ctx,event).
  * Call sites (kept compatible):
  *   run_actions_raw(service, &ctx, exitActs,  event, fromName, toName);
@@ -460,7 +489,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
                             const char *toName) {
   (void)fromName;
   (void)toName; // currently unused (kept for signature compatibility)
-  if (!actionsArr || !jsvIsArray(actionsArr))
+  if (!actionsArr)
     return;
 
   /* --- Resolve actions map (preferred -> fallbacks) ---
@@ -502,11 +531,35 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
     }
   }
 
-  unsigned int len = (unsigned int)jsvGetArrayLength(actionsArr);
+  bool isArr = jsvIsArray(actionsArr);
+  unsigned int len = isArr ? (unsigned int)jsvGetArrayLength(actionsArr) : (unsigned int)1;
+
+  /* PASS 1: apply all assign-like items to update *pCtx before other actions */
   for (unsigned int i = 0; i < len; i++) {
-    JsVar *item = jsvGetArrayItem(actionsArr, i); // LOCKED (or 0)
-    if (!item)
+    JsVar *item = isArr ? jsvGetArrayItem(actionsArr, (JsVarInt)i)
+                        : jsvLockAgain(actionsArr); // LOCKED
+    if (!item) continue;
+
+    if (jsvIsObject(item) && is_assign_like(item)) {
+      apply_assignment(service, pCtx, item, eventObj);
+      jsvUnLock(item);
       continue;
+    }
+
+    jsvUnLock(item);
+  }
+
+  /* PASS 2: execute non-assign actions in listed order */
+  for (unsigned int i = 0; i < len; i++) {
+    JsVar *item = isArr ? jsvGetArrayItem(actionsArr, (JsVarInt)i)
+                        : jsvLockAgain(actionsArr); // LOCKED
+    if (!item) continue;
+
+    /* Skip assign-like items here (already applied) */
+    if (jsvIsObject(item) && is_assign_like(item)) {
+      jsvUnLock(item);
+      continue;
+    }
 
     bool handled = false;
 
@@ -543,7 +596,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
       if (exec)
         jsvUnLock(exec);
 
-      /* B2) { type:"..." } */
+      /* B2) { type:"..." } (non-assign) */
       if (!handled) {
         JsVar *typ = jsvObjectGetChild(item, "type", 0);
         if (typ && jsvIsString(typ)) {
@@ -553,11 +606,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
             tlen = 0;
           tbuf[tlen] = 0;
 
-          if (!strcmp(tbuf, "xstate.assign") || !strcmp(tbuf, "assign")) {
-            /* assign family -> updates *pCtx */
-            apply_assignment(service, pCtx, item, eventObj);
-            handled = true;
-          } else if (actsMap && jsvIsObject(actsMap)) {
+          if (actsMap && jsvIsObject(actsMap)) {
             /* NEW: object-form named action via actions map(s) */
             JsVar *fn = jsvObjectGetChild(actsMap, tbuf, 0);
             if (fn && jsvIsFunction(fn)) {
@@ -581,11 +630,7 @@ void run_actions_raw(JsVar *service, JsVar **pCtx, JsVar *actionsArr,
           jsvUnLock(typ);
       }
 
-      /* B3) shorthand assign object (no type/exec) */
-      if (!handled) {
-        apply_assignment(service, pCtx, item, eventObj);
-        handled = true;
-      }
+      /* B3) (removed) shorthand assign handled in PASS 1 */
     }
 
     /* C) "name" -> resolve via actions map(s) */
@@ -816,18 +861,67 @@ JsVar *xfsm_machine_initial_state(JsVar *machine) {
   }
 
   JsVar *node = jsvObjectGetChild(states, initBuf, 0);
-  JsVar *entryArr = 0;
+  JsVar *entryRaw = 0;
   if (node && jsvIsObject(node)) {
-    entryArr = jsvObjectGetChild(node, K_ENTRY, 0);
+    entryRaw = jsvObjectGetChild(node, K_ENTRY, 0);
   }
 
-  /* Context for machine path is the config.context (service owns its own copy) */
-  JsVar *ctx = jsvObjectGetChild(cfg, K_CONTEXT, 0);
+  /* Build working context as a copy of config.context (service owns its own copy later) */
+  JsVar *ctxBase = jsvObjectGetChild(cfg, K_CONTEXT, 0); /* may be 0 */
+  JsVar *ctx = jsvNewObject();
+  if (!ctx) {
+    if (entryRaw) jsvUnLock(entryRaw);
+    if (node) jsvUnLock(node);
+    jsvUnLock(states);
+    jsvUnLock(cfg);
+    return 0;
+  }
+  if (ctxBase && jsvIsObject(ctxBase)) {
+    JsvObjectIterator it;
+    jsvObjectIteratorNew(&it, ctxBase);
+    while (jsvObjectIteratorHasValue(&it)) {
+      JsVar *k = jsvObjectIteratorGetKey(&it);
+      JsVar *v = jsvObjectIteratorGetValue(&it);
+      if (k && v) {
+        JsVar *ks = jsvAsString(k);
+        char keybuf[64] = "";
+        if (ks) { jsvGetString(ks, keybuf, sizeof(keybuf)); jsvUnLock(ks); }
+        if (keybuf[0]) jsvObjectSetChildAndUnLock(ctx, keybuf, jsvLockAgain(v));
+      }
+      if (k) jsvUnLock(k);
+      if (v) jsvUnLock(v);
+      jsvObjectIteratorNext(&it);
+    }
+    jsvObjectIteratorFree(&it);
+  }
+  if (ctxBase) jsvUnLock(ctxBase);
 
-  JsVar *st = new_state_obj(initBuf, ctx, entryArr, false /*changed*/);
+  /* Split entry into assigns (apply to ctx now) and non-assign actions (defer to start) */
+  JsVar *nonAssignActs = jsvNewArray(NULL, 0);
+  if (entryRaw) {
+    bool isArr = jsvIsArray(entryRaw);
+    JsVarInt len = isArr ? jsvGetArrayLength(entryRaw) : 1;
+    JsVar *evtInit = jsvNewObject();
+    if (evtInit) jsvObjectSetChildAndUnLock(evtInit, "type", jsvNewFromString("xstate.init"));
 
+    for (JsVarInt i=0;i<len;i++) {
+      JsVar *item = isArr ? jsvGetArrayItem(entryRaw, i) : jsvLockAgain(entryRaw);
+      if (!item) continue;
+      if (jsvIsObject(item) && is_assign_like(item)) {
+        apply_assignment(0 /*svc unused*/, &ctx, item, evtInit);
+      } else {
+        jsvArrayPush(nonAssignActs, item);
+      }
+      jsvUnLock(item);
+    }
+    if (evtInit) jsvUnLock(evtInit);
+  }
+
+  JsVar *st = new_state_obj(initBuf, ctx, nonAssignActs, false /*changed*/);
+
+  if (nonAssignActs) jsvUnLock(nonAssignActs);
   if (ctx) jsvUnLock(ctx);
-  if (entryArr) jsvUnLock(entryArr);
+  if (entryRaw) jsvUnLock(entryRaw);
   if (node) jsvUnLock(node);
   jsvUnLock(states);
   jsvUnLock(cfg);
@@ -989,20 +1083,31 @@ JsVar *xfsm_machine_transition_ex(JsVar *machine, JsVar *stateOrValue, JsVar *ev
   }
 
   if (!candSel) {
+    /* No-match => return unchanged state object with empty actions */
+    JsVar *allActs = jsvNewArray(NULL, 0);
+    JsVar *st = new_state_obj(fromBuf, guardCtx /*locked or 0*/, allActs, false /*changed*/);
+    if (allActs) jsvUnLock(allActs);
     if (cands) jsvUnLock(cands);
     if (exitArr) jsvUnLock(exitArr);
     if (onObj) jsvUnLock(onObj);
     jsvUnLock(srcNode);
     if (guardCtx) jsvUnLock(guardCtx);
     jsvUnLock(states); jsvUnLock(cfg);
-    return 0;
+    return st; /* LOCKED */
   }
 
-  /* Build actions = exit[] + transition.actions[] + (entry[] if targeted) */
+  /* Determine target before composing actions */
+  char toBuf[64] = "";
+  JsVar *t = jsvObjectGetChild(candSel, K_TARGET, 0);
+  if (t && jsvIsString(t)) str_from_jsv(t, toBuf, sizeof(toBuf));
+  if (t) jsvUnLock(t);
+  bool targetless = (toBuf[0] == 0);
+
+  /* Build actions: targeted => exit + trans.actions + entry; targetless => trans.actions only */
   JsVar *allActs = jsvNewArray(NULL, 0);
 
-  /* exit[] */
-  if (exitArr) {
+  /* exit[] only when targeted */
+  if (!targetless && exitArr) {
     if (jsvIsArray(exitArr)) {
       JsVarInt xlen = jsvGetArrayLength(exitArr);
       for (JsVarInt i=0;i<xlen;i++) { JsVar *a = jsvGetArrayItem(exitArr, i); if (a){ jsvArrayPush(allActs, a); jsvUnLock(a);} }
@@ -1021,13 +1126,6 @@ JsVar *xfsm_machine_transition_ex(JsVar *machine, JsVar *stateOrValue, JsVar *ev
       jsvArrayPush(allActs, transActs);
     }
   }
-
-  /* target? */
-  char toBuf[64] = "";
-  JsVar *t = jsvObjectGetChild(candSel, K_TARGET, 0);
-  if (t && jsvIsString(t)) str_from_jsv(t, toBuf, sizeof(toBuf));
-  if (t) jsvUnLock(t);
-  bool targetless = (toBuf[0] == 0);
 
   /* entry[] if targeted */
   if (!targetless) {
@@ -1048,7 +1146,7 @@ JsVar *xfsm_machine_transition_ex(JsVar *machine, JsVar *stateOrValue, JsVar *ev
   }
 
   /* create next state object (machine path: context is the guardCtx snapshot) */
-  bool changed = (!targetless) && (0 != strcmp(fromBuf, toBuf));
+  bool changed = ( (!targetless) && (0 != strcmp(fromBuf, toBuf)) ) || (jsvGetArrayLength(allActs) > 0);
   JsVar *st = new_state_obj(targetless ? fromBuf : toBuf, guardCtx /*locked or 0*/, allActs, changed);
 
   if (allActs) jsvUnLock(allActs);
